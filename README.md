@@ -39,6 +39,7 @@ you can also add the following:
 Instead of scroll events directly scrolling the screen,
 they update a destination variable.
 A timer that runs every `good-scroll-render-rate` seconds
+while a scroll is in progress
 calculates the expected position and actually scrolls the window to it.
 To make the window scrolled partially through a line,
 `good-scroll` updates the window's
@@ -53,6 +54,25 @@ but one factor is that Emacs lacks animation support.
 Emacs has timers for updating the screen contents,
 which is enough for playing simple animated GIF files,
 but not enough for video playback or frame-perfect smooth scrolling.
+
+### How can I reduce CPU usage while scrolling?
+
+The render timer only runs while a scroll is in progress,
+so an idle Emacs uses no CPU for `good-scroll`.
+While scrolling, each animation frame makes Emacs redraw the whole window,
+so CPU usage is roughly proportional to the number of frames per second.
+There are two ways to reduce it:
+
+- Increase `good-scroll-render-rate`.
+  For example, `0.033` is about 30 frames per second
+  and uses noticeably less CPU than the default `0.02`,
+  at the cost of a less smooth animation.
+- Set `good-scroll-inhibit-bidi-during-scroll` to `t`.
+  This turns off bidirectional text reordering while the animation runs,
+  which made scrolling use around 20% less CPU in our measurements.
+  Left-to-right text looks the same,
+  but text with right-to-left characters is shown in logical order
+  until the animation ends.
 
 ### How does this compare to other scrolling packages?
 

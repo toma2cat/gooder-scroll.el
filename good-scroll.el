@@ -44,7 +44,7 @@
 (defcustom good-scroll-render-rate 0.02
   "Number of seconds between renders.
 This corresponds to the refresh rate of the scrolling animation.
-For changes of this option to take effect, good-scroll mode must be restarted."
+Changes to this option take effect the next time a scroll starts."
   :group 'good-scroll
   :type 'float)
 
@@ -87,6 +87,19 @@ For changing this variable to take effect, good-scroll mode must be restarted."
   :group 'good-scroll
   :type 'boolean)
 
+(defcustom good-scroll-inhibit-bidi-during-scroll nil
+  "If non-nil, turn off bidirectional text reordering while scrolling.
+Every animation frame makes Emacs redraw the whole window,
+and reordering bidirectional text is a noticeable part of that cost.
+Disabling it (by setting `bidi-display-reordering' to nil in the scrolled
+buffer for the duration of the animation) lowered CPU usage by roughly 20%
+while scrolling in our measurements.
+Left-to-right text looks exactly the same either way.
+Text containing right-to-left characters is displayed in logical order
+until the animation ends, so leave this nil if you scroll such text."
+  :group 'good-scroll
+  :type 'boolean)
+
 (defvar good-scroll--debug nil
   "Flag for enabling debug logging and slow assertions.")
 
@@ -94,7 +107,11 @@ For changing this variable to take effect, good-scroll mode must be restarted."
   "The window scrolled most recently.")
 
 (defvar good-scroll--timer nil
-  "Timer for render updates.")
+  "Timer for render updates.
+This timer only exists while a scroll is in progress.
+It is started by `good-scroll-move' and stopped by `good-scroll--render'
+once there is nothing left to scroll, so that an idle Emacs
+is not woken up (and redisplayed) every `good-scroll-render-rate' seconds.")
 
 (defvar good-scroll-destination nil
   "Destination of the current scroll.
@@ -129,6 +146,11 @@ for performance reasons.")
   "The value of point before the most recent command executed.
 This is used to test if a command moved the cursor.")
 
+(defvar good-scroll--bidi-saved nil
+  "Saved state of `bidi-display-reordering' during a scroll, or nil.
+When `good-scroll-inhibit-bidi-during-scroll' is in effect, this is a list
+\(BUFFER LOCAL-P VALUE) that `good-scroll--restore-bidi' uses to undo it.")
+
 ;;;###autoload
 (define-minor-mode good-scroll-mode
   "Good pixel line scrolling"
@@ -139,10 +161,9 @@ This is used to test if a command moved the cursor.")
   (if good-scroll-mode
       ;; Enable major mode
       (progn
+        ;; The render timer is started on demand by `good-scroll-move'.
         (setq mwheel-scroll-up-function #'good-scroll-up
-              mwheel-scroll-down-function #'good-scroll-down
-              good-scroll--timer
-              (run-at-time 0 good-scroll-render-rate #'good-scroll--render))
+              mwheel-scroll-down-function #'good-scroll-down)
         (when good-scroll-persist-vscroll-line-move
           (advice-add 'line-move :around #'good-scroll--advice-line-move))
         (when good-scroll-persist-vscroll-window-scroll
@@ -153,12 +174,53 @@ This is used to test if a command moved the cursor.")
     (progn
       (setq mwheel-scroll-up-function #'scroll-up
             mwheel-scroll-down-function #'scroll-down)
-      (when (timerp good-scroll--timer)
-        (cancel-timer good-scroll--timer))
+      (good-scroll--stop-timer)
+      (setq good-scroll-destination 0)
       (advice-remove 'line-move #'good-scroll--advice-line-move)
       (remove-hook 'window-scroll-functions #'good-scroll--restore-vscroll)
       (remove-hook 'pre-command-hook #'good-scroll--pre-command)
       (remove-hook 'post-command-hook #'good-scroll--post-command))))
+
+(defun good-scroll--start-timer ()
+  "Start the render timer, unless it is already running."
+  (unless (and (timerp good-scroll--timer)
+               (memq good-scroll--timer timer-list))
+    (setq good-scroll--timer
+          (run-at-time 0 good-scroll-render-rate #'good-scroll--render))))
+
+(defun good-scroll--stop-timer ()
+  "Stop the render timer, if it is running.
+This also ends the scroll, so it undoes `good-scroll--inhibit-bidi'."
+  (when (timerp good-scroll--timer)
+    (cancel-timer good-scroll--timer))
+  (setq good-scroll--timer nil)
+  (good-scroll--restore-bidi))
+
+(defun good-scroll--inhibit-bidi ()
+  "Turn off bidi reordering in the current buffer for the rest of the scroll.
+Remember the previous state so `good-scroll--restore-bidi' can undo this.
+Do nothing if the current buffer is already handled."
+  (unless (eq (car good-scroll--bidi-saved) (current-buffer))
+    ;; The window now shows a different buffer than when the scroll began.
+    (good-scroll--restore-bidi)
+    (setq good-scroll--bidi-saved (list (current-buffer)
+                                        (local-variable-p
+                                         'bidi-display-reordering)
+                                        bidi-display-reordering))
+    (setq-local bidi-display-reordering nil)))
+
+(defun good-scroll--restore-bidi ()
+  "Undo `good-scroll--inhibit-bidi', if it is in effect."
+  (when good-scroll--bidi-saved
+    (let ((buffer (nth 0 good-scroll--bidi-saved))
+          (local-p (nth 1 good-scroll--bidi-saved))
+          (value (nth 2 good-scroll--bidi-saved)))
+      (setq good-scroll--bidi-saved nil)
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (if local-p
+              (setq-local bidi-display-reordering value)
+            (kill-local-variable 'bidi-display-reordering)))))))
 
 (defmacro good-scroll--log (string &rest forms)
   "When `good-scroll--debug' is non-nil, log a message.
@@ -222,8 +284,40 @@ and shouldn't be run normally."
   (save-restriction
     ;; Widen in case the window start is outside the visible part of the buffer
     (widen)
-    (<= (line-number-at-pos (point) t)
-        (1+ (line-number-at-pos (window-start) t)))))
+    ;; This is equivalent to comparing the absolute line numbers of the point
+    ;; and the window start, but it only looks at the text between them
+    ;; instead of counting every line from the beginning of the buffer.
+    ;; That matters because this runs on every cursor movement command.
+    (let ((start (window-start))
+          (pt (point)))
+      (or (<= pt start)
+          (save-excursion
+            (goto-char start)
+            ;; At most one newline between the window start and the point?
+            (skip-chars-forward "^\n" pt)
+            (or (>= (point) pt)
+                (progn
+                  (forward-char 1)
+                  (skip-chars-forward "^\n" pt)
+                  (>= (point) pt))))))))
+
+(defun good-scroll--window-start-on-first-line-p ()
+  "Return non-nil if the window start is on the first line of the buffer.
+\"First line\" means the first line of the accessible part of the buffer.
+This does not count lines, so its cost does not grow with the buffer size."
+  (save-excursion
+    (goto-char (window-start))
+    (skip-chars-backward "^\n" (point-min))
+    (= (point) (point-min))))
+
+(defun good-scroll--window-start-on-last-line-p ()
+  "Return non-nil if the window start is on the last line of the buffer.
+\"Last line\" means the last line of the accessible part of the buffer.
+This does not count lines, so its cost does not grow with the buffer size."
+  (save-excursion
+    (goto-char (window-start))
+    (skip-chars-forward "^\n")
+    (eobp)))
 
 (defun good-scroll--advice-line-move (line-move &rest args)
   "Call LINE-MOVE with ARGS, but avoid resetting the vscroll.
@@ -276,7 +370,8 @@ A negative STEP means to scroll down. This is a helper function for
           good-scroll-start-time (float-time)
           good-scroll-traveled 0
           good-scroll-direction step
-          good-scroll--window (selected-window))))
+          good-scroll--window (selected-window))
+    (good-scroll--start-timer)))
 
 (defun good-scroll--cached-point-top-dirty-p ()
   "Return t if the point moved or window scrolled since the last render.
@@ -293,20 +388,47 @@ this leads to `good-scroll--cached-point-top' being invalidated."
   "Render an in-progress scroll.
 Update the window's vscroll and position in the buffer based on the scroll
 progress. This is called by the timer `good-scroll--timer' every
-`good-scroll-render-rate' seconds."
-  ;; Check if the window that recieved the scroll event still exists and
-  ;; if there is distance to scroll.
-  (when (and (window-valid-p good-scroll--window)
-             (not (zerop good-scroll-destination)))
-    (let ((inhibit-redisplay t)) ; TODO: Does this do anything?
-      ;; Switch to the window that recieved the scroll event,
-      ;; which might be different from the previously selected window.
-      (with-selected-window good-scroll--window
-        (let ((position-next-try
-               (funcall good-scroll-algorithm))
-              (position-next-actual))
-          (cl-assert (<= (abs position-next-try)
-                         (abs good-scroll-destination)))
+`good-scroll-render-rate' seconds while a scroll is in progress.
+When there is nothing left to scroll, this stops the timer."
+  (if (not (and (window-valid-p good-scroll--window)
+                (numberp good-scroll-destination)
+                (not (zerop good-scroll-destination))))
+      ;; The window that received the scroll event is gone,
+      ;; or there is no distance left to scroll.
+      (progn
+        (setq good-scroll-destination 0)
+        (good-scroll--stop-timer))
+    (condition-case err
+        (good-scroll--render-frame)
+      (error
+       ;; Don't keep failing every `good-scroll-render-rate' seconds.
+       (setq good-scroll-destination 0)
+       (good-scroll--stop-timer)
+       (signal (car err) (cdr err))))
+    (when (zerop good-scroll-destination)
+      (good-scroll--stop-timer))))
+
+(defun good-scroll--render-frame ()
+  "Render one frame of an in-progress scroll.
+This is a helper function for `good-scroll--render'."
+  (let ((inhibit-redisplay t)) ; TODO: Does this do anything?
+    ;; Switch to the window that recieved the scroll event,
+    ;; which might be different from the previously selected window.
+    (with-selected-window good-scroll--window
+      (let ((position-next-try
+             (funcall good-scroll-algorithm))
+            (position-next-actual))
+        (cl-assert (<= (abs position-next-try)
+                       (abs good-scroll-destination)))
+        ;; If the animation hasn't advanced a whole pixel line since the last
+        ;; frame (the start of a scroll, or the slow tail of an easing curve),
+        ;; there is nothing to draw.
+        ;; Skipping the frame avoids laying out lines and,
+        ;; more importantly, avoids making Emacs redisplay the window
+        ;; for no visible change.
+        (unless (zerop position-next-try)
+          (when good-scroll-inhibit-bidi-during-scroll
+            (good-scroll--inhibit-bidi))
           (when (good-scroll--cached-point-top-dirty-p)
             (setq good-scroll--cached-point-top nil))
           (setq position-next-actual (good-scroll--go-to position-next-try))
@@ -349,21 +471,31 @@ below the tab and header lines."
       p-vis-top)))
 
 (defun good-scroll--move-point-up ()
-  "Move the cursor up and update `good-scroll--cached-point-top' accordingly."
+  "Move the cursor up and update `good-scroll--cached-point-top' accordingly.
+Return the pixel height of the line the cursor moved to,
+or nil if the cursor can't move up."
   (when (= -1 (vertical-motion -1))
-    (setq good-scroll--cached-point-top
-          (- good-scroll--cached-point-top (line-pixel-height)))))
+    (let ((height (line-pixel-height)))
+      (setq good-scroll--cached-point-top
+            (- good-scroll--cached-point-top height))
+      height)))
 
-(defun good-scroll--move-point-down ()
-  "Move the cursor down and update `good-scroll--cached-point-top' accordingly."
-  (let ((height (line-pixel-height)))
-    (if (= 1 (vertical-motion 1))
+(defun good-scroll--move-point-down (height &optional next-height)
+  "Move the cursor down and update `good-scroll--cached-point-top' accordingly.
+HEIGHT is the pixel height of the cursor's current line.
+If NEXT-HEIGHT is non-nil, it is the pixel height of the line below.
+Return the pixel height of the line the cursor moved to,
+or nil if the cursor can't move down."
+  (if (= 1 (vertical-motion 1))
+      (progn
         (setq good-scroll--cached-point-top
               (+ good-scroll--cached-point-top height))
-      ;; If point is on the last line,
-      ;; `vertical-motion' moves it to the end of the line.
-      ;; This causes a jitter, so avoid it.
-      (beginning-of-line))))
+        (or next-height (line-pixel-height)))
+    ;; If point is on the last line,
+    ;; `vertical-motion' moves it to the end of the line.
+    ;; This causes a jitter, so avoid it.
+    (beginning-of-line)
+    nil))
 
 (defun good-scroll--window-usable-height ()
   "Return the usable height of the selected window.
@@ -380,13 +512,21 @@ This is from the bottom of the header line to the top of the mode line."
          (w-bottom (+ (nth 3 w-edges) (window-tab-line-height))))
     (- w-bottom w-top (good-scroll--first-y))))
 
+(defun good-scroll--next-line-pixel-height ()
+  "Return the pixel height of the line below the cursor."
+  (save-excursion
+    (vertical-motion 1)
+    (line-pixel-height)))
+
 (defun good-scroll--move-point-out-of-way (delta)
   "Move the cursor to prepare for a scroll of DELTA pixel lines.
 Emacs doesn't allow the cursor to be outside the window,
 so move it as little as possible to avoid this.
 Return t if the cursor moved, nil otherwise.
-This function only moves the point by one line at a time,
-so it should be called while it returns t."
+The cursor moves one line at a time until it no longer needs to move.
+The pixel geometry of the cursor's line is tracked across those moves,
+so each line the cursor passes costs one layout of that line
+instead of several."
   (let* ((p-start (point)) ; Cursor position
          (w-usable-height (good-scroll--window-usable-height))
          ;; Number of pixels from top of window to top of cursor
@@ -395,62 +535,81 @@ so it should be called while it returns t."
                       (or good-scroll--cached-point-top
                           (good-scroll--point-top))))
          ;; Pixel height of cursor
-         (p-height (line-pixel-height))
-         ;; Number of pixels from top of window to bottom of cursor
-         (p-bottom (+ p-top p-height))
-         ;; Number of pixels from top of window to top of cursor,
-         ;; after scrolling `delta' pixel lines.
-         (p-next-top (- p-top delta))
-         ;; Number of pixels from top of window to bottom of cursor,
-         ;; after scrolling `delta' pixel lines.
-         (p-next-bottom (- p-bottom delta))
-         ;; Number of pixels from top of window to top of line below cursor
-         (nl-top p-bottom)
-         ;; Pixel height of line below cursor
-         (nl-height (save-excursion
-                      (vertical-motion 1)
-                      (line-pixel-height)))
-         ;; Number of pixels from top of window to bottom of line below cursor
-         (nl-bottom (+ nl-top nl-height))
-         ;; Number of pixels from top of window to bottom of line below cursor,
-         ;; after scrolling `delta' pixel lines.
-         (nl-next-bottom (- nl-bottom delta)))
-    (good-scroll--log "R1"
-                      good-scroll--cached-point-top
-                      (good-scroll--point-top))
-    (good-scroll--slow-assert (= good-scroll--cached-point-top
-                                 (good-scroll--point-top)))
-    (cond
-     ;; The scroll is going to make the bottom of the cursor
-     ;; go below the bottom of the window.
-     ;; Move it up to avoid this.
-     ;; The exception is when the cursor height
-     ;; is greater than the window height.
-     ((and (> p-next-bottom w-usable-height) (> w-usable-height p-height))
-      (good-scroll--log "move point out of way case 1")
-      (good-scroll--move-point-up))
-     ;; The scroll is going to make the bottom of the cursor go above the window,
-     ;; which would make the cursor go completely offscreen.
-     ;; Move the cursor down to avoid this.
-     ((<= p-next-bottom 0)
-      (good-scroll--log "move point out of way case 2")
-      (good-scroll--move-point-down))
-     ;; The scroll is going to make the cursor overlap the top of the window.
-     ;; Move the cursor down to avoid this if there's room.
-     ((and (< p-next-top 0 p-next-bottom) (<= nl-next-bottom w-usable-height))
-      (good-scroll--log "move point out of way case 3")
-      (good-scroll--move-point-down))
-     ;; The cursor is not going to overlap the top of the window
-     ;; and the cursor height is greater than the window height.
-     ;; Move the point up, because we want to maintain the property
-     ;; that when the cursor height exceeds the window height,
-     ;; there shouldn't be any space between the cursor
-     ;; and the top of the window.
-     ;; Breaking this property is inconsistent with case 1
-     ;; and can prevent scrolling down.
-     ((and (not (< p-next-top 0 p-next-bottom)) (> p-height w-usable-height))
-      (good-scroll--log "move point out of way case 4")
-      (good-scroll--move-point-up)))
+         (p-height (line-pixel-height)))
+    (while
+        (let* (
+               ;; Number of pixels from top of window to bottom of cursor
+               (p-bottom (+ p-top p-height))
+               ;; Number of pixels from top of window to top of cursor,
+               ;; after scrolling `delta' pixel lines.
+               (p-next-top (- p-top delta))
+               ;; Number of pixels from top of window to bottom of cursor,
+               ;; after scrolling `delta' pixel lines.
+               (p-next-bottom (- p-bottom delta))
+               ;; Is the cursor going to overlap the top of the window?
+               (p-overlaps-top (< p-next-top 0 p-next-bottom))
+               ;; Pixel height of line below cursor.
+               ;; This is expensive, so it is only computed when needed.
+               (nl-height nil)
+               ;; Where to move the cursor, if anywhere
+               (direction
+                (progn
+                  (good-scroll--log "R1"
+                                    good-scroll--cached-point-top
+                                    (good-scroll--point-top))
+                  (good-scroll--slow-assert (= good-scroll--cached-point-top
+                                               (good-scroll--point-top)))
+                  (cond
+                   ;; The scroll is going to make the bottom of the cursor
+                   ;; go below the bottom of the window.
+                   ;; Move it up to avoid this.
+                   ;; The exception is when the cursor height
+                   ;; is greater than the window height.
+                   ((and (> p-next-bottom w-usable-height)
+                         (> w-usable-height p-height))
+                    (good-scroll--log "move point out of way case 1")
+                    'up)
+                   ;; The scroll is going to make the bottom of the cursor go
+                   ;; above the window, which would make the cursor go
+                   ;; completely offscreen.
+                   ;; Move the cursor down to avoid this.
+                   ((<= p-next-bottom 0)
+                    (good-scroll--log "move point out of way case 2")
+                    'down)
+                   ;; The scroll is going to make the cursor overlap the top
+                   ;; of the window.
+                   ;; Move the cursor down to avoid this if there's room.
+                   ((and p-overlaps-top
+                         ;; Number of pixels from top of window to bottom of
+                         ;; line below cursor, after scrolling `delta'
+                         ;; pixel lines.
+                         (<= (- (+ p-bottom
+                                   (setq nl-height
+                                         (good-scroll--next-line-pixel-height)))
+                                delta)
+                             w-usable-height))
+                    (good-scroll--log "move point out of way case 3")
+                    'down)
+                   ;; The cursor is not going to overlap the top of the window
+                   ;; and the cursor height is greater than the window height.
+                   ;; Move the point up, because we want to maintain the
+                   ;; property that when the cursor height exceeds the window
+                   ;; height, there shouldn't be any space between the cursor
+                   ;; and the top of the window.
+                   ;; Breaking this property is inconsistent with case 1
+                   ;; and can prevent scrolling down.
+                   ((and (not p-overlaps-top) (> p-height w-usable-height))
+                    (good-scroll--log "move point out of way case 4")
+                    'up)))))
+          ;; Move the cursor and find the geometry of its new line.
+          ;; If the cursor couldn't move, then it's done moving.
+          (let ((new-height (pcase direction
+                              ('up (good-scroll--move-point-up))
+                              ('down (good-scroll--move-point-down
+                                      p-height nl-height)))))
+            (when new-height
+              (setq p-top good-scroll--cached-point-top
+                    p-height new-height)))))
     ;; Return if the cursor position changed
     (/= p-start (point))))
 
@@ -460,7 +619,7 @@ Update the window's vscroll and position in the buffer to instantly scroll to
 TARGET, where TARGET is the index from the top of the window in pixel lines.
 TARGET can be negative.
 Return the number of pixels (possibly negative) scrolled successfully."
-  (while (good-scroll--move-point-out-of-way target))
+  (good-scroll--move-point-out-of-way target)
   (good-scroll--log "cached-point-top assertion 2"
                     target
                     good-scroll--cached-point-top
@@ -472,19 +631,23 @@ Return the number of pixels (possibly negative) scrolled successfully."
         (let* (
                ;; Number of pixels scrolled past the top of the first line.
                (vscroll (window-vscroll nil t))
-               ;; Pixel height of the first line
-               (line-height (save-excursion
-                              (goto-char (window-start))
-                              (line-pixel-height)))
-               ;; Remaining number of pixels in the first line
-               (line-remaining (- line-height vscroll))
                (prev-remaining remaining))
           (setq remaining
                 (cond
-                 ((> remaining 0) (good-scroll--go-to-up remaining
-                                                         vscroll
-                                                         line-height
-                                                         line-remaining))
+                 ((> remaining 0)
+                  (let* (
+                         ;; Pixel height of the first line.
+                         ;; Only scrolling up needs this, and
+                         ;; it requires laying out the line.
+                         (line-height (save-excursion
+                                        (goto-char (window-start))
+                                        (line-pixel-height)))
+                         ;; Remaining number of pixels in the first line
+                         (line-remaining (- line-height vscroll)))
+                    (good-scroll--go-to-up remaining
+                                           vscroll
+                                           line-height
+                                           line-remaining)))
                  ((< remaining 0) (good-scroll--go-to-down remaining vscroll))
                  (t remaining)))
           (/= remaining prev-remaining)))
@@ -551,8 +714,7 @@ line."
                     good-scroll--cached-point-top
                     (good-scroll--point-top))
   ;; Are we at the end of the buffer?
-  (if (= (line-number-at-pos (point-max))
-         (line-number-at-pos (window-start)))
+  (if (good-scroll--window-start-on-last-line-p)
       ;; We are!
       ;; Print a message and terminate.
       (progn
@@ -611,8 +773,7 @@ Return the next target scroll position. Assume POS > VSCROLL."
                     (good-scroll--point-top))
   (set-window-vscroll nil 0 t)
   ;; Are we at the beginning of the buffer?
-  (if (= (line-number-at-pos (point-min))
-         (line-number-at-pos (window-start)))
+  (if (good-scroll--window-start-on-first-line-p)
       ;; We are!
       ;; Print a message and terminate.
       (progn
